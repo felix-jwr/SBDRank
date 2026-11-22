@@ -27,7 +27,7 @@ def update_headers(local_metadata: dict) -> dict:
     headers = {
         header_key: local_metadata[metadata_key]
         for header_key, metadata_key in key_map.items()
-        if local_metadata.get(metadata_key) 
+        if local_metadata.get(metadata_key)
     }
 
     return headers
@@ -63,7 +63,7 @@ def bundle_metadata_from_response(response: httpx.Response) -> dict:
         if response_value := response.headers.get(key):
             metadata[key] = response_value
 
-    return metadata 
+    return metadata
 
 
 def write_new_metadata(metadata_path: Path, new_metadata: dict) -> None:
