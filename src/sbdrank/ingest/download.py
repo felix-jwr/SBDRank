@@ -7,6 +7,7 @@ import httpx
 def update_local_zip(url: str, local_zip_path: Path) -> None:
     local_metadata_path = local_zip_path.with_suffix(".json")
     local_metadata = get_metadata_from_json(local_metadata_path)
+    local_metadata = usable_metadata(local_metadata, local_zip_path)
     headers = update_headers(local_metadata)
 
     with httpx.stream("GET", url, headers=headers, timeout=60) as response:
@@ -26,7 +27,7 @@ def update_headers(local_metadata: dict) -> dict:
     headers = {
         header_key: local_metadata[metadata_key]
         for header_key, metadata_key in key_map.items()
-        if metadata_key in local_metadata
+        if local_metadata.get(metadata_key) 
     }
 
     return headers
@@ -36,20 +37,33 @@ def get_metadata_from_json(local_metadata_path: Path) -> dict:
     return json.loads(local_metadata_path.read_text()) if local_metadata_path.exists() else {}
 
 
-def write_new_zip(response, local_zip_path: Path) -> dict:
-    with local_zip_path.open("wb") as f:
+def usable_metadata(local_metadata: dict, local_zip_path: Path) -> dict:
+    if local_zip_path.exists():
+        return local_metadata
+    else:
+        return {}
+
+
+def write_new_zip(response: httpx.Response, local_zip_path: Path) -> dict:
+    temp_path = local_zip_path.with_name(local_zip_path.name + ".part")
+
+    with temp_path.open("wb") as f:
         for chunk in response.iter_bytes():
             f.write(chunk)
 
+    Path.replace(temp_path, local_zip_path)
     return bundle_metadata_from_response(response)
 
 
 def bundle_metadata_from_response(response: httpx.Response) -> dict:
-    local_metadata = {}
-    local_metadata["ETag"] = response.headers.get("ETag")
-    local_metadata["Last-Modified"] = response.headers.get("Last-Modified")
+    metadata = {}
+    response_keys = ["ETag", "Last-Modified"]
 
-    return local_metadata
+    for key in response_keys:
+        if response_value := response.headers.get(key):
+            metadata[key] = response_value
+
+    return metadata 
 
 
 def write_new_metadata(metadata_path: Path, new_metadata: dict) -> None:

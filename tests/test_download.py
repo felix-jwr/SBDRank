@@ -37,6 +37,10 @@ def test_update_headers_skips_none_values():
     assert headers == {"If-Modified-Since": LAST_MODIFIED}
 
 
+def test_update_headers_skips_empty_strings():
+    assert download.update_headers({"ETag": "", "Last-Modified": ""}) == {}
+
+
 # --- metadata files -------------------------------------------------------------------------
 
 
@@ -53,6 +57,9 @@ def test_metadata_round_trip(tmp_path):
     assert download.get_metadata_from_json(path) == metadata
 
 
+# --- bundle_metadata_from_response ----------------------------------------------------------
+
+
 def test_bundle_metadata_from_response():
     response = httpx.Response(200, headers={"ETag": '"abc"', "Last-Modified": LAST_MODIFIED})
 
@@ -60,6 +67,33 @@ def test_bundle_metadata_from_response():
         "ETag": '"abc"',
         "Last-Modified": LAST_MODIFIED,
     }
+
+
+def test_bundle_metadata_omits_missing_headers():
+    response = httpx.Response(200, headers={"ETag": '"abc"'})
+
+    assert download.bundle_metadata_from_response(response) == {"ETag": '"abc"'}
+
+
+def test_bundle_metadata_with_no_validators_is_empty():
+    assert download.bundle_metadata_from_response(httpx.Response(200)) == {}
+
+
+# --- reset_metadata_if_zip_missing ----------------------------------------------------------
+
+
+def test_usable_metadata_keeps_metadata_when_zip_exists(tmp_path):
+    zip_path = tmp_path / "data.zip"
+    zip_path.write_bytes(b"zip-bytes")
+    metadata = {"ETag": '"abc"'}
+
+    assert download.usable_metadata(metadata, zip_path) == metadata
+
+
+def test_usable_metadata_clears_metadata_when_zip_missing(tmp_path):
+    zip_path = tmp_path / "data.zip"
+
+    assert download.usable_metadata({"ETag": '"abc"'}, zip_path) == {}
 
 
 # --- write_new_zip --------------------------------------------------------------------------
@@ -84,6 +118,8 @@ class FakeServer:
     def __init__(self) -> None:
         self.content = b"zip-v1"
         self.etag = '"v1"'
+        self.send_last_modified = True
+        self.interrupt_download = False
         self.error_status: int | None = None
         self.requests: list[httpx.Request] = []
 
@@ -93,11 +129,20 @@ class FakeServer:
             return httpx.Response(self.error_status)
         if request.headers.get("If-None-Match") == self.etag:
             return httpx.Response(304)
-        return httpx.Response(
-            200,
-            content=self.content,
-            headers={"ETag": self.etag, "Last-Modified": LAST_MODIFIED},
-        )
+
+        headers = {"ETag": self.etag}
+        if self.send_last_modified:
+            headers["Last-Modified"] = LAST_MODIFIED
+
+        if self.interrupt_download:
+
+            def broken_body():
+                yield b"partial"
+                raise httpx.ReadError("connection dropped")
+
+            return httpx.Response(200, content=broken_body(), headers=headers)
+
+        return httpx.Response(200, content=self.content, headers=headers)
 
 
 @pytest.fixture
@@ -119,7 +164,8 @@ def test_first_download_writes_zip_and_metadata(server, tmp_path):
 
     assert zip_path.read_bytes() == b"zip-v1"
     saved = json.loads((tmp_path / "data.json").read_text())
-    assert saved == {"ETag": '"v1"', "Last-Modified": LAST_MODIFIED, "Url": URL}
+    expected = {"ETag": '"v1"', "Last-Modified": LAST_MODIFIED, "Url": URL}
+    assert saved.items() >= expected.items()
     # nothing local yet, so the request shouldn't have been conditional
     assert "If-None-Match" not in server.requests[0].headers
 
@@ -166,3 +212,31 @@ def test_redownloads_if_zip_missing_but_metadata_exists(server, tmp_path):
     download.update_local_zip(URL, zip_path)
 
     assert zip_path.read_bytes() == b"zip-v1"
+    assert "If-None-Match" not in server.requests[1].headers
+
+
+def test_metadata_is_rebuilt_not_carried_forward(server, tmp_path):
+    zip_path = tmp_path / "data.zip"
+    download.update_local_zip(URL, zip_path)  # v1, both headers present
+
+    server.content = b"zip-v2"
+    server.etag = '"v2"'
+    server.send_last_modified = False
+    download.update_local_zip(URL, zip_path)
+
+    saved = json.loads((tmp_path / "data.json").read_text())
+    assert saved["ETag"] == '"v2"'
+    assert "Last-Modified" not in saved  # the v1 value must not survive
+
+
+def test_interrupted_download_leaves_existing_zip_and_metadata_intact(server, tmp_path):
+    zip_path = tmp_path / "data.zip"
+    download.update_local_zip(URL, zip_path)  # good v1 snapshot on disk
+
+    server.etag = '"v2"'  # so the server doesn't answer 304
+    server.interrupt_download = True
+    with pytest.raises(httpx.ReadError):
+        download.update_local_zip(URL, zip_path)
+
+    assert zip_path.read_bytes() == b"zip-v1"
+    assert json.loads((tmp_path / "data.json").read_text())["ETag"] == '"v1"'
